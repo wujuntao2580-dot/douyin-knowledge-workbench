@@ -1,0 +1,14 @@
+/.runtime/
+/data/
+__pycache__/
+*.py[cod]
+*.mp4
+*.wav
+*.srt
+*.gguf
+*.onnx
+*.zip
+*.db
+*.sqlite*
+*.log
+.env*
