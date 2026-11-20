@@ -6,13 +6,15 @@ import socket
 import sqlite3
 import subprocess
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, build_opener, ProxyHandler
+
+from douyin_account import cookie_header, read_download_config
 
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -25,6 +27,10 @@ HOME = re.compile(r"/user/([\w-]+)", re.ASCII)
 URL = re.compile(r"https://www\.douyin\.com/video/([0-9]{19})/?(?:\?[^\s]*)?")
 NO_WINDOW = subprocess.CREATE_NO_WINDOW
 OPENER = build_opener(ProxyHandler({}))
+
+
+def tool_timeout(config, minimum):
+    return max(minimum, config.get("timeout", 10) * (config.get("max_retry", 5) + 1) + 15)
 
 
 def video_url(video_id):
@@ -60,15 +66,18 @@ class DouK:
         database = volume / "DouK-Downloader.db"
         if not database.exists():
             source = INSTALLED / "Volume/DouK-Downloader.db"
-            with sqlite3.connect(source.as_uri() + "?mode=ro", uri=True) as original:
-                with sqlite3.connect(database) as target:
+            if not source.is_file():
+                raise ValueError("请先打开 .runtime/douk/DouK-Downloader.exe 完成首次语言及提示设置，再回工作台重试。")
+            with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as original:
+                with closing(sqlite3.connect(database)) as target:
                     original.backup(target)
-        with sqlite3.connect(database) as target:
+        with closing(sqlite3.connect(database)) as target:
             target.execute("UPDATE config_data SET VALUE = 0 WHERE NAME = 'Record'")
             target.execute("DELETE FROM download_data")
-        config = json.loads((INSTALLED / "Volume/settings.json").read_text(encoding="utf-8-sig"))
+            target.commit()
+        config = read_download_config()
         if not config.get("cookie"):
-            raise ValueError("DouK 尚未配置抖音登录，请在 DouK 主菜单更新登录信息。")
+            raise ValueError("请先在页面的「抖音账号」中登录")
         settings = volume / "settings.json"
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
@@ -109,15 +118,17 @@ class DouK:
                         except (URLError, TimeoutError):
                             time.sleep(0.3)
                     else:
-                        raise ValueError("DouK 搜索服务启动失败，请检查安装和抖音登录。")
+                        raise ValueError("搜索服务启动失败，请在右侧「抖音账号」检查登录。")
                     yield port
                 finally:
                     if process.poll() is None:
                         process.terminate()
 
     def search(self, keyword):
+        config = read_download_config()
         with self.api() as port:
-            result = receive_douk(port, "/douyin/search/user", {"keyword": keyword, "pages": 1, "count": 12})
+            result = receive_douk(port, "/douyin/search/user", {"keyword": keyword, "pages": 1, "count": 12},
+                                  timeout=tool_timeout(config, 40))
         return [creator for row in result_items(result) if (creator := search_creator(row))]
 
     def works(self, profile):
@@ -131,7 +142,8 @@ class DouK:
                 name = share.get("url")
                 if not isinstance(name, str) or not (sec_id := profile_id(name)):
                     raise ValueError("分享链接没有指向抖音主播主页")
-            result = receive_douk(port, "/douyin/account", {"sec_user_id": sec_id, "tab": "post", "count": 20}, timeout=120)
+            result = receive_douk(port, "/douyin/account", {"sec_user_id": sec_id, "tab": "post", "count": 20},
+                                  timeout=tool_timeout(read_download_config(), 120))
         return {**normalize_works(result, sec_id), "profile": f"https://www.douyin.com/user/{sec_id}"}
 
     @contextmanager
@@ -142,7 +154,8 @@ class DouK:
                 batch.write_text(video_url(video_id) + "\n", encoding="utf-8")
                 result = subprocess.run([executable], cwd=self.directory,
                                         input=f"5\n2\n2\n{batch}\nQ\nQ\nQ\n".encode("utf-8"),
-                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        timeout=tool_timeout(read_download_config(), 180),
                                         creationflags=NO_WINDOW)
                 output = result.stdout.decode("utf-8", "replace")
                 if not any(stage.glob(f"{video_id}*.mp4")):
@@ -155,7 +168,7 @@ class DouK:
 def result_items(result):
     data = result.get("data")
     if data is None:
-        raise ValueError("抖音未返回数据，请检查 DouK 的抖音登录后重试。")
+        raise ValueError("抖音未返回数据，请在右侧「抖音账号」检查登录后重试。")
     if isinstance(data, list):
         return data
     for key in ("aweme_list", "data", "items", "list", "user_list", "works"):
@@ -202,7 +215,7 @@ def work_metrics(row):
     return metrics
 
 
-def normalize_works(result, sec_id):
+def normalize_works(result, sec_id, *, allow_empty=False):
     creator = {"name": "", "account": sec_id}
     works = {}
     for raw in result_items(result):
@@ -215,7 +228,9 @@ def normalize_works(result, sec_id):
             continue
         author = row.get("author") or {}
         name = author.get("nickname") or row.get("nickname") or row.get("author_nickname")
-        account = author.get("unique_id") or row.get("unique_id") or author.get("short_id") or row.get("short_id")
+        account = next((str(value) for value in (author.get("unique_id"), row.get("unique_id"),
+                       author.get("short_id"), row.get("short_id"), author.get("sec_uid"), row.get("sec_uid"))
+                       if value and str(value) != "0"), "")
         if name:
             creator["name"] = str(name)
         if account:
@@ -224,33 +239,63 @@ def normalize_works(result, sec_id):
         if isinstance(date, (int, float)) or isinstance(date, str) and date.isdecimal() and len(date) == 10:
             date = datetime.fromtimestamp(int(date)).date().isoformat()
         works[video_id] = {"id": video_id, "title": str(row.get("desc") or row.get("title") or video_id),
-                           "date": str(date)[:10], "url": video_url(video_id), "metrics": work_metrics(row)}
-    if not works:
+                           "date": str(date)[:10], "url": video_url(video_id), "metrics": work_metrics(row),
+                           "author": {"name": str(name or ""), "account": account,
+                                      "secUid": str(author.get("sec_uid") or row.get("sec_uid") or "")}}
+    if not works and not allow_empty:
         raise ValueError("该主页没有返回可用的视频作品")
     return {"creator": creator, "works": list(works.values()), "source": "DouK"}
 
 
 class F2Downloader:
+    def favorites_page(self, kind, folder="all", cursor=0):
+        if kind not in {"folders", "videos"} or type(cursor) is not int or not 0 <= cursor < 2**53:
+            raise ValueError("收藏列表请求无效")
+        if not isinstance(folder, str) or not re.fullmatch(r"(?:all|[0-9]{1,25})", folder):
+            raise ValueError("请选择有效的收藏夹")
+        config = read_download_config()
+        with TemporaryDirectory(prefix="workbench-favorites-") as directory:
+            result = subprocess.run([F2_PYTHON, "-B", "-X", "utf8", Path(__file__).with_name("f2_favorites.py")],
+                                    cwd=directory,
+                                    input=json.dumps({"kind": kind, "folder": folder, "cursor": cursor,
+                                                      "cookie": self.cookie(), "timeout": config.get("timeout", 10),
+                                                      "max_retries": config.get("max_retry", 5)}),
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                                    encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+                                    timeout=tool_timeout(config, 45))
+        payload = next((line.removeprefix("F2_FAVORITES ") for line in result.stdout.splitlines()
+                        if line.startswith("F2_FAVORITES ")), None)
+        if payload is None:
+            raise ValueError("无法读取收藏，请检查网络和右侧的抖音登录状态。")
+        page = json.loads(payload)
+        if page.get("error"):
+            raise ValueError(page["error"])
+        if result.returncode:
+            raise ValueError("收藏列表读取失败，请重试。")
+        return page
+
     @staticmethod
     def cookie():
         if not F2.is_file():
             raise ValueError("F2 尚未安装或验证")
-        config = json.loads((INSTALLED / "Volume/settings.json").read_text(encoding="utf-8-sig"))
+        config = read_download_config()
         cookie = config.get("cookie")
-        if isinstance(cookie, dict):
-            cookie = "; ".join(f"{name}={value}" for name, value in cookie.items())
         if not cookie:
-            raise ValueError("未配置抖音登录")
-        return cookie
+            raise ValueError("请先在页面的「抖音账号」中登录")
+        return cookie_header(cookie)
 
     def works(self, profile):
         sec_id = profile_id(profile)
         if not sec_id:
             raise ValueError("F2 请使用浏览器打开后的抖音主页完整链接")
+        config = read_download_config()
         result = subprocess.run([F2_PYTHON, "-B", "-X", "utf8", Path(__file__).with_name("f2_works.py")],
-                                input=json.dumps({"sec_id": sec_id, "cookie": self.cookie()}),
+                                input=json.dumps({"sec_id": sec_id, "cookie": self.cookie(),
+                                                  "timeout": config.get("timeout", 10),
+                                                  "max_retries": config.get("max_retry", 5)}),
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                                encoding="utf-8", errors="replace", creationflags=NO_WINDOW, timeout=135)
+                                encoding="utf-8", errors="replace", creationflags=NO_WINDOW,
+                                timeout=tool_timeout(config, 135))
         payload = next((line.removeprefix("F2_WORKS ") for line in result.stdout.splitlines()
                         if line.startswith("F2_WORKS ")), None)
         if result.returncode or not payload:
@@ -265,11 +310,14 @@ class F2Downloader:
             with TemporaryDirectory(dir=stage.parent, prefix="f2-") as directory:
                 root = Path(directory)
                 settings = root / "f2-config.json"
-                settings.write_text(json.dumps({"douyin": {"cookie": cookie}}, ensure_ascii=False), encoding="utf-8")
+                config = read_download_config()
+                settings.write_text(json.dumps({"douyin": {"cookie": cookie, "timeout": config.get("timeout", 10),
+                                                           "max_retries": config.get("max_retry", 5)}},
+                                               ensure_ascii=False), encoding="utf-8")
                 subprocess.run([F2, "dy", "-c", settings, "-u", video_url(video_id), "-M", "one",
                                 "-p", root, "-n", "{aweme_id}"], cwd=root,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=180, creationflags=NO_WINDOW)
+                               timeout=tool_timeout(config, 180), creationflags=NO_WINDOW)
                 source = next((path for path in root.rglob("*.mp4")
                                if path.stem in {video_id, f"{video_id}_video"}), None)
                 if source is None:

@@ -15,6 +15,10 @@ from uuid import uuid4
 import av
 
 from providers import CACHE, PROJECT, F2, ID, URL, DouK, F2Downloader, video_url, work_metrics
+from douyin_account import DouyinAccount
+
+sys.path.insert(0, str(PROJECT / 'app/knowledge'))
+from library_state import LibraryState
 
 sys.path.insert(0, str(PROJECT / "app/compression"))
 from compress_downloads import BUILDER, MEDIA, compress_video
@@ -32,7 +36,7 @@ PROFILE_CACHE = CACHE / "creator-profiles.json"
 LOG = logging.getLogger("workbench.workflow")
 ACCOUNT = re.compile(r"[\w.-]{1,180}")
 LOCAL_ID = re.compile(r"^([0-9]{19})(?![0-9])")
-DEFAULTS = {"autoTranscribe": False, "autoImport": False, "downloader": "douk", "catalogTool": "douk",
+DEFAULTS = {"autoTranscribe": True, "autoImport": True, "downloader": "douk", "catalogTool": "douk",
             "transcribeDevice": "cpu"}
 
 
@@ -79,8 +83,7 @@ def archive_path(video_id):
 
 
 def known_catalogs():
-    registry = read_registry()
-    for creator_id, creator in registry.items():
+    for creator_id, creator in read_registry().items():
         yield creator_id.removeprefix("douyin:"), creator
 
 
@@ -96,8 +99,11 @@ def existing_media(video_ids):
 
 def legacy_or_registered():
     indexed = {}
+    removed = LibraryState().deleted_records()
     for account, creator in known_catalogs():
         for video_id, work in load_works(f"douyin:{account}", creator).items():
+            if video_id in removed:
+                continue
             indexed[video_id] = (account, work)
     return indexed
 
@@ -152,13 +158,23 @@ try {
 
 
 class Workflow:
-    def __init__(self, state_file=STATE_FILE, douk=None):
+    def retire_deleted(self, ids):
+        """Keep batch history but prevent old workers/retry controls restoring deleted material."""
+        for batch in self.state['batches']:
+            for row in batch['works']:
+                if row['id'] in ids:
+                    row.update(deleted=True, download='skipped', transcribe='skipped',
+                               compressionState='skipped', compression='已清理所选资料', **{'import': 'skipped'})
+        self.save()
+
+    def __init__(self, state_file=STATE_FILE, douk=None, account=None):
         self.file = state_file
         self.file.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
         self.provider_lock = Lock()
         self.douk = douk or DouK()
         self.providers = {"douk": self.douk, "f2": F2Downloader()}
+        self.account = account or DouyinAccount(queue_path=state_file)
         self.state = (json.loads(self.file.read_text(encoding="utf-8")) if self.file.exists()
                       else {"settings": DEFAULTS.copy(), "batches": []})
         self.active = None
@@ -188,7 +204,7 @@ class Workflow:
         with self.lock:
             data = json.loads(json.dumps(self.state))
         data["settings"] = {**DEFAULTS, **data["settings"]}
-        return {**data, "f2": self.f2_status()}
+        return {**data, "f2": self.f2_status(), "account": self.account.view()}
 
     @staticmethod
     def f2_status():
@@ -202,12 +218,30 @@ class Workflow:
             self.save()
 
     def act(self, route, data):
+        if route == "login-open":
+            return self.account.open_login()
+        if route == "login-save":
+            return self.account.save_browser()
+        if route == "login-close":
+            return self.account.close_login()
+        if route == "login-check":
+            return self.account.check()
+        if route == "login-cookie":
+            return self.account.save(data.get("cookie"))
         if route == "settings":
             downloader = data.get("downloader", "douk")
             catalog_tool = data.get("catalogTool", "douk")
             device = data.get("transcribeDevice", "cpu")
             if device not in ("cpu", "cuda"):
                 raise ValueError("请选择 CPU 或 NVIDIA 显卡加速")
+            config = self.account.view()
+            timeout = data.get("downloadTimeout", config["downloadTimeout"])
+            retries = data.get("downloadRetries", config["downloadRetries"])
+            if type(timeout) is not int or not 3 <= timeout <= 120:
+                raise ValueError("请求超时请填写 3 至 120 秒")
+            if type(retries) is not int or not 0 <= retries <= 10:
+                raise ValueError("重试次数请填写 0 至 10")
+            default_folder = str(folder_path(data.get("defaultFolder") or str(PROJECT / "data/inputs")))
             backup = self.f2_status()
             if downloader not in self.providers or downloader == "f2" and not backup["download"]:
                 raise ValueError("当前无法使用这个下载工具")
@@ -215,6 +249,8 @@ class Workflow:
                 raise ValueError("当前无法使用这个主页作品工具")
             with self.lock:
                 self.state["settings"] = {"downloader": downloader, "catalogTool": catalog_tool,
+                                          "downloadTimeout": timeout, "downloadRetries": retries,
+                                          "defaultFolder": default_folder,
                                           "transcribeDevice": device,
                                           "autoTranscribe": data.get("autoTranscribe") is True,
                                           "autoImport": data.get("autoImport") is True}
@@ -270,6 +306,15 @@ class Workflow:
             if known := saved_profiles().get(result.get("profile")):
                 result["creator"] = {"name": known["name"], "account": known["account"]}
             return self.decorate(result)
+        if route == "favorite-folders":
+            with self.provider_lock:
+                return self.providers["f2"].favorites_page("folders", cursor=data.get("cursor", 0))
+        if route == "favorite-videos":
+            folder = data.get("folder", "all")
+            with self.provider_lock:
+                result = self.providers["f2"].favorites_page("videos", folder, data.get("cursor", 0))
+            decorated = self.decorate({"creator": {}, "works": result["items"]})
+            return {**result, "items": decorated["works"]}
         if route == "text":
             return self.text_works(str(data.get("text", "")))
         if route == "local":
@@ -363,7 +408,10 @@ class Workflow:
         if not rows:
             raise ValueError("清单中没有视频链接")
         prior = legacy_or_registered()
+        removed = LibraryState().deleted_records()
         for video_id, row in rows.items():
+            if video_id in removed:
+                row['forceImport'] = True
             if video_id in prior:
                 work = prior[video_id][1]
                 row.update(title=work.get("title") or work.get("desc") or video_id,
@@ -392,6 +440,12 @@ class Workflow:
         account = safe_account(data.get("account"))
         is_local = data.get("local") is True
         compress = data.get("compress") is not False
+        classification = data.get('classificationMode')
+        if classification not in ('auto', 'manual'):
+            raise ValueError('请为本批视频选择自动归属或推荐后手动确认')
+        from_favorites = data.get("sourceType") == "favorites"
+        if from_favorites and is_local:
+            raise ValueError("收藏来源不能同时使用本地视频导入")
         destination = folder_path(data.get("destination"), allow_create=not is_local)
         selection = data.get("works")
         if not isinstance(selection, list) or not 1 <= len(selection) <= 3000:
@@ -409,6 +463,15 @@ class Workflow:
                       "metrics": work_metrics(item),
                       "compressionState": "waiting" if compress else "skipped",
                       "download": "pending", "transcribe": "pending", "import": "pending"}
+            if from_favorites:
+                author = item.get("author")
+                if not isinstance(author, dict):
+                    raise ValueError("收藏视频缺少原作者信息，请重新加载收藏夹")
+                author_name = str(author.get("name") or "").strip()
+                author_account = str(author.get("account") or "")
+                if author_name and len(author_name) <= 100 and ACCOUNT.fullmatch(author_account) and author_account not in {".", ".."}:
+                    record["author"] = {"name": author_name, "account": author_account,
+                                        "secUid": str(author.get("secUid") or "")}
             if is_local:
                 file = Path(str(item.get("file", ""))).resolve()
                 if file.parent != destination or file.suffix.lower() != ".mp4" or not file.is_file():
@@ -416,21 +479,28 @@ class Workflow:
                 record["file"] = str(file)
             rows[video_id] = record
         prior = legacy_or_registered()
+        removed = LibraryState().deleted_records()
         for video_id, row in rows.items():
+            if video_id in removed:
+                row['forceImport'] = True
             if video_id in prior:
                 row["import"] = "existing"
         batch = {"id": uuid4().hex[:12], "name": name, "account": account, "destination": str(destination),
-                 "local": is_local, "compress": compress, "works": list(rows.values()), "created": datetime.now().isoformat(timespec="minutes"),
+                 "sourceType": "favorites" if from_favorites else "creator",
+                 "local": is_local, "compress": compress, "classificationMode": classification, "works": list(rows.values()), "created": datetime.now().isoformat(timespec="minutes"),
                  "stage": "", "error": ""}
         with self.lock:
             if self.active:
                 raise ValueError("已有一批作品正在处理")
             self.state["batches"].insert(0, batch)
+            LibraryState().restore_import(list(rows))
             self.start(batch, "download", batch["works"])
         return {"batch": batch["id"]}
 
     @staticmethod
     def eligible(row, stage):
+        if row.get('deleted'):
+            return False
         if row[stage] not in {"pending", "failed"}:
             return False
         if stage == "transcribe":
@@ -671,16 +741,57 @@ class Workflow:
 
     def import_works(self, batch, rows):
         self.stage(batch, "import")
+        LibraryState().mark_import([row['id'] for row in rows], batch.get('classificationMode', 'manual'))
+        groups = {}
+        profiles = saved_profiles()
+        for row in rows:
+            if batch.get("sourceType") == "favorites":
+                identity = row.get("author") or {}
+                known_profile = profiles.get("https://www.douyin.com/user/" + identity.get("secUid", ""))
+                account = known_profile["account"] if known_profile else identity.get("account")
+                name = known_profile["name"] if known_profile else identity.get("name")
+            else:
+                account, name = batch["account"], batch["name"]
+            if not account or not name:
+                self.update(row, "import", "failed", "缺少原作者资料，请重新加载收藏夹后重试。")
+                continue
+            groups.setdefault((account, name), []).append(row)
+        prepared = []
+        for (account, name), group in groups.items():
+            try:
+                prepared.extend(self.prepare_import(batch, group, account, name))
+            except (OSError, ValueError) as error:
+                for row in group:
+                    self.update(row, "import", "failed", message(error))
+        if not prepared:
+            return
         directory = self.batch_path(batch)
-        account = batch["account"]
+        selected = directory / "approved-ids.json"
+        save_json(selected, [row["id"] for row, _, _ in prepared])
+        with (directory / "summary.log").open("ab") as log:
+            result = subprocess.run([PYTHON, "-B", "-X", "utf8", SUMMARIZE, "--only", selected, "--no-popup",
+                                     "--server-log", directory / "model.log"],
+                                    stdout=log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+        for row, records, summaries in prepared:
+            key = row["id"]
+            target = summaries / f"{key}.json"
+            source = records / f"{key}.json"
+            if (target.is_file() and source.is_file()
+                    and json.loads(target.read_text(encoding="utf-8")).get("source_sha256") == hashlib.sha256(source.read_bytes()).hexdigest()):
+                self.update(row, "import", "done")
+            else:
+                self.update(row, "import", "failed", "已登记，离线摘要待重试。" if result.returncode else "未生成摘要，可重试。")
+
+    def prepare_import(self, batch, rows, account, name):
+        directory = self.batch_path(batch)
         creator_key = f"douyin:{account}"
         known = legacy_or_registered()
         registry = read_registry()
         creator = registry.get(creator_key, {})
-        if creator and creator["name"] != batch["name"]:
+        if creator and creator["name"] != name:
             raise ValueError("该抖音号已绑定其他主播名称，请使用原名称。")
         records = PROJECT / creator.get("records", f"data/creators/{account}/transcripts")
-        subtitles = PROJECT / creator.get("subtitles", f"data/creators/{account}")
+        subtitles = PROJECT / creator.get("subtitles", f"data/creators/{account}/subtitles")
         summaries = PROJECT / creator.get("summaries", f"data/creators/{account}/summaries")
         records.mkdir(parents=True, exist_ok=True)
         subtitles.mkdir(parents=True, exist_ok=True)
@@ -689,6 +800,8 @@ class Workflow:
         for row in rows:
             key = row["id"]
             old = known.get(key)
+            if row.get('forceImport'):
+                old = None
             if old and (old[0] != account or (row["import"] == "pending" and not row.get("registered"))):
                 self.update(row, "import", "existing")
                 continue
@@ -700,37 +813,21 @@ class Workflow:
                     temp = target.with_suffix(target.suffix + ".workflow.tmp")
                     shutil.copyfile(source, temp)
                     temp.replace(target)
-                items.append({"videoId": key, "authorNickname": batch["name"], "contentType": "video",
+                items.append({"videoId": key, "authorNickname": name, "contentType": "video",
                               "title": row["title"], "date": row["date"], "videoUrl": row["url"],
                               "workbenchMedia": row["file"], "workbenchLocalOnly": not row["url"],
                               "metrics": row.get("metrics", {})})
             ids.append(key)
         if not ids:
-            return
+            return []
         if items:
             catalog = directory / f"approved-{uuid4().hex[:8]}.json"
             save_json(catalog, {"accountSlug": account, "douyinId": account, "works": items})
-            register(account, batch["name"], catalog)
+            register(account, name, catalog)
         for row in rows:
             if row["id"] in ids:
                 self.update(row, "import", "running", registered=True)
-        selected = directory / "approved-ids.json"
-        save_json(selected, ids)
-        with (directory / "summary.log").open("ab") as log:
-            result = subprocess.run([PYTHON, "-B", "-X", "utf8", SUMMARIZE, "--only", selected, "--no-popup",
-                                     "--server-log", directory / "model.log"],
-                                    stdout=log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
-        for row in rows:
-            key = row["id"]
-            if key not in ids:
-                continue
-            target = summaries / f"{key}.json"
-            source = records / f"{key}.json"
-            if (target.is_file() and source.is_file()
-                    and json.loads(target.read_text(encoding="utf-8")).get("source_sha256") == hashlib.sha256(source.read_bytes()).hexdigest()):
-                self.update(row, "import", "done")
-            else:
-                self.update(row, "import", "failed", "已登记，离线摘要待重试。" if result.returncode else "未生成摘要，可重试。")
+        return [(row, records, summaries) for row in rows if row["id"] in ids]
 
 
 def message(error):

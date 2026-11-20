@@ -12,6 +12,8 @@ let catalog = [];
 let chosen = new Set();
 let page = 0;
 let local = false;
+let favorites = null;
+let nextFolderCursor = null;
 let status = null;
 let current = "";
 let approved = new Set();
@@ -19,14 +21,95 @@ let approvedFrom = "";
 let lastBatch = "";
 let lastBatchList = "";
 let working = false;
-const pageSize = 35;
+const pageSize = 8;
 const metricLabels = {plays: "播放量", likes: "点赞", saves: "收藏"};
 const countFormat = new Intl.NumberFormat("zh-CN");
+let source = "creator";
+const sourceStates = new Map();
+let favoriteFoldersLoaded = false;
+
+function activateView(view) {
+  for (const name of ["pick", "tasks"]) {
+    get(name + "-view").hidden = name !== view;
+    get(name + "-tab").setAttribute("aria-selected", String(name === view));
+  }
+}
+get("pick-tab").onclick = () => activateView("pick");
+get("tasks-tab").onclick = () => activateView("tasks");
+get("workflow-home").onclick = event => {event.preventDefault();activateView("pick");};
+for (const button of document.querySelectorAll("[data-close]")) button.onclick = () => get(button.dataset.close).close();
+get("account-open").onclick = () => get("account-dialog").showModal();
+get("settings-open").onclick = () => {fillSettings();get("settings-dialog").showModal();};
+get("change-creator").onclick = () => {get("keyword").focus();get("keyword").select();};
+for (const button of document.querySelectorAll("[data-sort]")) button.onclick = () => {
+  get("sort").value = button.dataset.sort;
+  page = 0;
+  drawCatalog();
+};
+get("compress-downloads").onchange = () => {
+  get("compression-help").textContent = get("compress-downloads").checked
+    ? "压缩在后台排队，下载可以继续。" : "保留原视频，下载完成就能转写。";
+};
+function selectSource(next) {
+  if (next === source) return;
+  sourceStates.set(source, {catalog, chosen, page, local, favorites,
+    name:get("name").value, account:get("account").value, destination:get("destination").value,
+    title:get("creator-name").textContent, caption:get("catalog-source").textContent});
+  source = next;
+  for (const button of document.querySelectorAll("[data-source]")) {
+    const active = button.dataset.source === source;
+    button.setAttribute("aria-selected", String(active));
+    get("source-" + button.dataset.source).hidden = !active;
+  }
+  const saved = sourceStates.get(source);
+  catalog = saved?.catalog || [];chosen = saved?.chosen || new Set();page = saved?.page || 0;
+  local = saved?.local || false;favorites = saved?.favorites || null;
+  for (const name of ["name", "account", "destination"]) get(name).value = saved?.[name] || "";
+  get("creator-name").textContent = saved?.title || "";
+  get("catalog-source").textContent = saved?.caption || "";
+  get("creator-avatar").textContent = (saved?.title || (source === "favorites" ? "藏" : "播")).slice(0,1);
+  get("picker").hidden = !saved;
+  get("picker-empty").hidden = Boolean(saved);
+  get("creator-fields").hidden = !saved || Boolean(favorites) || Boolean(saved.name && saved.account && !local);
+  get("name").required = get("account").required = !get("creator-fields").hidden;
+  get("change-creator").hidden = source !== "creator";
+  get("destination").readOnly = local;
+  get("folder").hidden = local;
+  get("more-favorite-videos").hidden = !favorites?.more;
+  drawCatalog();
+  if (source === "favorites" && !favoriteFoldersLoaded) task(() => loadFavoriteFolders());
+}
+for (const button of document.querySelectorAll("[data-source]")) button.onclick = () => {
+  if (working) {show("当前请求正在处理，请稍候再切换来源。");return;}
+  selectSource(button.dataset.source);
+};
+
+function drawRecent() {
+  const creators = [...new Map((status?.batches || []).filter(row => row.sourceType !== "favorites" && !row.local)
+    .map(row => [row.account, row])).values()].slice(0,3);
+  const parent = get("recent-creators");
+  parent.hidden = !creators.length;
+  parent.replaceChildren(element("span", "最近处理"), ...creators.map(row => button(row.name, () => {
+    get("keyword").value = row.account;
+    get("search-form").requestSubmit();
+  })));
+}
 
 function show(message, error = false) {
   notice.textContent = message;
   notice.classList.toggle("error", error);
   notice.hidden = !message;
+  for (const dialog of document.querySelectorAll("dialog")) {
+    let feedback = dialog.querySelector(".dialog-notice");
+    if (!feedback) {
+      feedback = element("p", "", "dialog-notice");
+      feedback.setAttribute("role", "status");
+      dialog.querySelector(".dialog-head").after(feedback);
+    }
+    feedback.textContent = message;
+    feedback.hidden = !message || !dialog.open;
+    feedback.classList.toggle("error-text", error);
+  }
 }
 
 async function api(route, payload = {}) {
@@ -42,10 +125,20 @@ async function api(route, payload = {}) {
 async function task(fn) {
   if (working) return;
   working = true;
+  document.body.classList.add("busy");
+  const submits = [...document.querySelectorAll("form button[type=submit], #search-form button, #login-open, #login-save, #login-check")];
+  const disabled = submits.map(button => button.disabled);
+  submits.forEach(button => button.disabled = true);
   show("");
   try { await fn(); }
   catch (error) { show(error.message, true); }
-  finally { working = false; }
+  finally {
+    working = false;
+    document.body.classList.remove("busy");
+    submits.forEach((button, index) => button.disabled = disabled[index]);
+    updateSelection();
+    if (status) drawAccount();
+  }
 }
 
 function submit(id, fn) {
@@ -72,6 +165,10 @@ function button(label, fn) {
 function openCatalog(data, folder = "") {
   catalog = data.works;
   local = data.source === "本地视频";
+  favorites = data.sourceType === "favorites" ? data.favorites : null;
+  get("creator-fields").hidden = Boolean(favorites) || Boolean(data.creator.name && data.creator.account && !local);
+  get("name").required = get("account").required = !get("creator-fields").hidden;
+  get("more-favorite-videos").hidden = !favorites?.more;
   page = 0;
   chosen.clear();
   get("name").value = data.creator.name || "";
@@ -80,9 +177,12 @@ function openCatalog(data, folder = "") {
     ? status.defaultFolder + "\\" + data.creator.account : "");
   get("destination").readOnly = local;
   get("folder").hidden = local;
-  get("start").textContent = local ? "添加所选" : "下载所选";
+  get("creator-name").textContent = data.creator.name || (local ? "本地视频" : "链接清单");
+  get("creator-avatar").textContent = (data.creator.name || (local ? "本地" : "链接")).slice(0,1);
+  get("change-creator").hidden = source !== "creator";
   get("catalog-source").textContent = data.source + " · " + catalog.length + " 条视频";
   get("picker").hidden = false;
+  get("picker-empty").hidden = true;
   drawCatalog();
 }
 
@@ -118,22 +218,40 @@ function drawCatalog() {
   note.textContent = known
     ? known + " / " + list.length + " 条有" + metricLabel + "数据，缺失的作品排在最后。"
     : "这份清单暂无" + metricLabel + "数据，暂按最新发布排列。";
+  get("list-total").textContent = list.length + " 条作品";
+  for (const button of document.querySelectorAll("[data-sort]")) {
+    button.setAttribute("aria-pressed", String(button.dataset.sort === order));
+    const name = button.dataset.sort;
+    const missing = metricLabels[name] && !catalog.some(row => row.metrics?.[name] !== undefined);
+    button.classList.toggle("unavailable", Boolean(missing));
+    button.title = missing ? "这份清单暂未提供" + metricLabels[name] + "数据" : "";
+  }
   page = Math.min(page, Math.max(0, Math.ceil(list.length / pageSize) - 1));
   get("works").replaceChildren(...list.slice(page * pageSize, (page + 1) * pageSize).map(item => {
-    const label = element("label", "", "work");
+    const label = element("label", "", "work" + (chosen.has(item.id) ? " selected" : ""));
     const control = check(chosen.has(item.id), item.title, checked => {
       if (checked) chosen.add(item.id); else chosen.delete(item.id);
+      label.classList.toggle("selected", checked);
       updateSelection();
     });
-    const metrics = Object.entries(metricLabels)
-      .filter(([key]) => item.metrics?.[key] !== undefined)
-      .map(([key, title]) => title + " " + countFormat.format(item.metrics[key]));
-    const details = element("small", "", "work-meta");
-    details.append(element("span", [item.date, item.existing].filter(Boolean).join(" · ")));
-    if (metrics.length) details.append(element("span", metrics.join(" · ")));
-    label.append(control, element("span", item.title), details);
+    const copy = element("div", "", "video-copy");
+    const title = element("p", item.title, "video-title");
+    title.title = item.title;
+    copy.append(title, element("small", [favorites ? item.author?.name || "原作者待补充" : "",
+      item.date || "日期未提供", item.existing].filter(Boolean).join(" · "), "video-meta"));
+    label.append(control, copy);
+    for (const metric of ["plays", "likes", "saves"]) {
+      if (metric === "plays" && order !== "plays") continue;
+      const value = item.metrics?.[metric];
+      const text = value === undefined ? "—" : value >= 10000 ? (value / 10000).toFixed(1) + "万" : countFormat.format(value);
+      const number = element("div", text, "video-metric" + (metric === "plays" ? " plays-metric" : ""));
+      number.append(element("small", metricLabels[metric]));
+      label.append(number);
+    }
+    label.classList.toggle("with-plays", order === "plays");
     return label;
   }));
+  if (!list.length) get("works").append(element("p", "当前没有符合条件的视频。", "empty"));
   get("page").textContent = list.length ? (page + 1) + " / " + Math.ceil(list.length / pageSize) : "没有符合条件的视频";
   get("previous").disabled = page === 0;
   get("next").disabled = (page + 1) * pageSize >= list.length;
@@ -146,7 +264,14 @@ function updateSelection() {
   get("all-works").checked = Boolean(n && n === fresh.length);
   get("all-works").indeterminate = n > 0 && n < fresh.length;
   get("selection").textContent = "已选 " + chosen.size + " 条";
-  get("start").disabled = !chosen.size;
+  get("selected-count").textContent = chosen.size;
+  get("start").textContent = (local ? "导入所选 " : "下载所选 ") + chosen.size + " 条";
+  get("start").disabled = !chosen.size || working || !status;
+  get("summary-title").textContent = local ? "本次导入" : "本次下载";
+  get("asr-mode").textContent = status?.settings.autoTranscribe ? "自动" : "手动";
+  get("import-mode").textContent = status?.settings.autoImport ? "自动" : "手动";
+  get("start-hint").textContent = !chosen.size ? "先从左侧勾选感兴趣的视频。" : status?.settings.autoTranscribe
+    ? "提交后自动转写，可在「任务进度」里查看。" : "提交后，在「任务进度」里开始转写。";
 }
 
 async function loadProfile(value) {
@@ -154,14 +279,21 @@ async function loadProfile(value) {
   if (!match) throw new Error("请填入抖音主播主页链接");
   show("正在获取作品列表…");
   openCatalog(await api("works", {profile: match[0]}));
+  clearCreatorResults();
   show("");
 }
 
-submit("search-form", async () => {
-  show("正在搜索主播…");
+function clearCreatorResults() {
   get("creators").hidden = true;
   get("creators").replaceChildren();
-  const data = await api("search", {keyword: get("keyword").value});
+}
+
+submit("search-form", async () => {
+  const keyword = get("keyword").value.trim();
+  if (/https:\/\/(?:www\.|v\.)douyin\.com\//.test(keyword)) return loadProfile(keyword);
+  show("正在搜索主播…");
+  clearCreatorResults();
+  const data = await api("search", {keyword});
   get("creators").replaceChildren(...data.creators.map(row => {
     const label = row.account ? row.name + " · 抖音号 " + row.account : row.name;
     const control = button(label, () => task(() => loadProfile(row.profile)));
@@ -181,7 +313,66 @@ submit("search-form", async () => {
     : "没有搜到符合条件的主播。");
 });
 
-submit("profile-form", () => loadProfile(get("profile").value));
+async function loadFavoriteFolders(cursor = 0) {
+  show("正在读取收藏夹…");
+  const data = await api("favorite-folders", {cursor});
+  favoriteFoldersLoaded = true;
+  const select = get("favorite-folder");
+  const current = select.value;
+  if (cursor === 0) select.replaceChildren(new Option("全部收藏", "all"));
+  const existing = new Set([...select.options].map(option => option.value));
+  for (const row of data.items) {
+    if (!existing.has(row.id)) {
+      const option = new Option(row.name + (row.count === null ? "" : " · " + row.count + " 条"), row.id);
+      option.dataset.name = row.name;
+      select.add(option);
+      existing.add(row.id);
+    }
+  }
+  if (existing.has(current)) select.value = current;
+  nextFolderCursor = data.more ? data.cursor : null;
+  get("more-favorite-folders").hidden = !data.more;
+  const note = get("favorite-folders-status");
+  note.hidden = false;
+  note.textContent = select.options.length > 1
+    ? "已读取 " + (select.options.length - 1) + " 个收藏夹。"
+    : "当前账号未返回命名收藏夹，可尝试「全部收藏」，或在右上角检查登录。";
+  show("");
+}
+
+get("favorite-folders").addEventListener("click", () => task(() => loadFavoriteFolders()));
+get("more-favorite-folders").addEventListener("click", () => task(() => loadFavoriteFolders(nextFolderCursor)));
+
+submit("favorites-form", async () => {
+  const select = get("favorite-folder");
+  const folder = select.value;
+  const title = select.selectedOptions[0].dataset.name || "全部收藏";
+  show("正在加载收藏视频…");
+  const data = await api("favorite-videos", {folder});
+  openCatalog({
+    sourceType: "favorites", source: "抖音收藏 · " + title,
+    creator: {name: ("收藏 · " + title).slice(0, 100), account: "favorites-" + folder},
+    works: data.items, favorites: {folder, title, more: data.more, cursor: data.cursor}
+  });
+  clearCreatorResults();
+  show(data.items.length ? "" : data.more
+    ? "本页没有可下载的视频，可继续加载下一页。"
+    : "当前账号未返回可下载的收藏视频，可在右上角检查登录。");
+});
+
+get("more-favorite-videos").addEventListener("click", () => task(async () => {
+  if (!favorites?.more) return;
+  show("正在加载更多收藏视频…");
+  const data = await api("favorite-videos", {folder: favorites.folder, cursor: favorites.cursor});
+  catalog = [...new Map([...catalog, ...data.items].map(row => [row.id, row])).values()];
+  favorites.more = data.more;
+  favorites.cursor = data.cursor;
+  get("more-favorite-videos").hidden = !data.more;
+  get("catalog-source").textContent = "抖音收藏 · " + favorites.title + " · 已加载 " + catalog.length + " 条视频";
+  drawCatalog();
+  show("");
+}));
+
 submit("cache-form", async () => openCatalog(await api("works", {profile: get("cached").value, cached: true})));
 submit("text-form", async () => openCatalog(await api("text", {text: get("links").value})));
 get("txt").addEventListener("change", () => task(async () => {
@@ -207,6 +398,50 @@ get("folder").addEventListener("click", () => task(async () => {
   const {path} = await api("choose");
   if (path) get("destination").value = path;
 }));
+get("default-folder-choose").addEventListener("click", () => task(async () => {
+  const {path} = await api("choose");
+  if (path) get("default-folder").value = path;
+}));
+
+function drawAccount() {
+  const account = status.account;
+  if (!account) return;
+  get("account-panel").hidden = false;
+  const labels = {missing: "请先登录抖音", saved: "已保存登录信息，可以检查当前账号",
+    connected: "已连接", check_failed: "登录检查未通过"};
+  get("account-status").textContent = (labels[account.state] || "请检查登录") +
+    (account.name ? " · " + account.name : "") +
+    (account.account ? " · 抖音号 " + account.account : "");
+  get("login-guide").hidden = !account.browserOpen;
+  get("login-save").hidden = !account.browserOpen;
+  get("login-close").hidden = !account.browserOpen;
+  get("login-open").disabled = account.browserOpen;
+  get("login-check").disabled = !account.configured;
+  get("account-dot").classList.toggle("not-connected", account.state !== "connected");
+  get("account-open").title = account.name || "抖音账号";
+}
+
+for (const action of ["login-open", "login-save", "login-close", "login-check"]) {
+  get(action).addEventListener("click", () => task(async () => {
+    show({"login-open": "正在打开抖音登录窗口…", "login-save": "正在验证并保存账号…",
+      "login-close": "正在关闭登录窗口…", "login-check": "正在检查抖音登录…"}[action]);
+    try {
+      await api(action);
+      show({"login-open": "请在弹出的抖音窗口完成登录，再回到这里保存。",
+        "login-save": "抖音账号已保存，搜索、收藏和下载会使用这个账号。",
+        "login-close": "登录窗口已关闭。", "login-check": "抖音登录检查通过。"}[action]);
+    } finally {
+      await refresh();
+    }
+  }));
+}
+submit("login-cookie-form", async () => {
+  show("正在检查登录信息…");
+  await api("login-cookie", {cookie: get("login-cookie").value});
+  get("login-cookie").value = "";
+  await refresh();
+  show("抖音账号已保存。");
+});
 for (const name of ["sort", "only-new"]) {
   get(name).addEventListener("change", () => { page = 0; drawCatalog(); });
 }
@@ -222,11 +457,15 @@ submit("start-form", async () => {
   const result = await api("start", {
     name: get("name").value, account: get("account").value,
     destination: get("destination").value, local, compress: get("compress-downloads").checked,
+    classificationMode: get('classification-mode').value,
+    sourceType: favorites ? "favorites" : "creator",
     works: catalog.filter(row => chosen.has(row.id))
   });
   current = result.batch;
+  get('classification-mode').value = '';
   await refresh();
-  get("batch-list").scrollIntoView({block:"nearest"});
+  activateView("tasks");
+  get("tasks-tab").focus();
   show(local ? "本地视频已添加到处理批次。" : "下载已提交。");
 });
 submit("settings-form", async () => {
@@ -235,8 +474,13 @@ submit("settings-form", async () => {
     catalogTool: get("catalog-tool").value,
     autoTranscribe: get("auto-transcribe").value === "true",
     transcribeDevice: get("transcribe-device").value,
-    autoImport: get("auto-import").value === "true"
+    autoImport: get("auto-import").value === "true",
+    ...(status.account ? {defaultFolder: get("default-folder").value,
+      downloadTimeout: Number(get("download-timeout").value),
+      downloadRetries: Number(get("download-retries").value)} : {})
   });
+  await refresh(true);
+  get("settings-dialog").close();
   show("默认方式已保存。下次开始任务时生效。");
 });
 get("batch-list").addEventListener("change", event => { current = event.target.value; drawBatch(); });
@@ -244,9 +488,9 @@ get("close-preview").addEventListener("click", () => get("preview").close());
 library.href = "#";
 library.addEventListener("click", event => {
   event.preventDefault();
-  if (history.length > 1) history.back();
-  else task(() => api("library"));
+  task(() => api("library"));
 });
+for (const link of document.querySelectorAll("[data-library]")) link.onclick = event => {event.preventDefault();library.click();};
 
 function eligible(row, stage) {
   return ["pending", "failed"].includes(row[stage]) &&
@@ -305,7 +549,7 @@ function drawBatch() {
   parent.hidden = !batch;
   get("empty").hidden = Boolean(batch);
   if (!batch) return;
-  const signature = JSON.stringify([batch, status.batches.some(item => item.stage)]);
+  const signature = JSON.stringify([batch, status.settings, status.batches.some(item => item.stage)]);
   if (signature === lastBatch) return;
   lastBatch = signature;
   if (approvedFrom !== batch.id) {
@@ -313,6 +557,8 @@ function drawBatch() {
     approved.clear();
   }
   const oldScroll = get("batch-works")?.scrollTop || 0;
+  const expanded = get("batch-details")?.open || false;
+  const operationsOpen = get("batch-operations")?.open || false;
   const states = {pending:"待处理", running:"处理中", done:"已完成", failed:"待重试", existing:"已入库",
     waiting:"等候下载", queued:"排队中", skipped:"已跳过"};
   const active = status.batches.some(item => item.stage);
@@ -331,6 +577,11 @@ function drawBatch() {
   dl.disabled = active || !toDownload.length;
   asr.disabled = active || !toTranscribe.length;
   all.disabled = active || !toImport.length;
+  dl.hidden = !toDownload.length;
+  asr.hidden = !toTranscribe.length;
+  all.hidden = !toImport.length;
+  dl.classList.toggle("primary", !toTranscribe.length && !toImport.length);
+  asr.classList.toggle("primary", Boolean(toTranscribe.length));
   const label = element("label", "全选待入库", "check");
   const control = check(false, "全选待入库", checked => {
     for (const row of toImport) { if (checked) approved.add(row.id); else approved.delete(row.id); }
@@ -339,20 +590,31 @@ function drawBatch() {
   });
   label.prepend(control);
   control.disabled = !toImport.length;
+  label.hidden = !toImport.length;
   const update = () => {
     const count = toImport.filter(row => approved.has(row.id)).length;
     control.checked = Boolean(count && count === toImport.length);
     control.indeterminate = Boolean(count && count < toImport.length);
     selected.textContent = "所选入库" + (count ? " " + count + " 条" : "");
     selected.disabled = active || !count;
+    selected.hidden = !count;
+    selected.classList.toggle("primary", Boolean(count));
+    all.classList.toggle("primary", !count && !toTranscribe.length);
   };
   update();
   actions.append(dl, asr, label, selected, all);
+  actions.classList.add("task-actions");
+  const operations = element("details", "", "task-operations");
+  operations.id = "batch-operations";
+  operations.open = operationsOpen;
+  operations.append(element("summary", "其他操作"));
+  const extras = element("div", "", "row");
+  operations.append(extras);
   if (batch.compress && batch.works.some(row => ["waiting", "queued", "failed"].includes(row.compressionState))) {
-    actions.append(button("跳过剩余压缩", () => runStage(batch, "skip-compression")));
+    extras.append(button("跳过剩余压缩", () => runStage(batch, "skip-compression")));
   }
   if (batch.compress && batch.works.some(row => row.compressionState === "failed")) {
-    actions.append(button("重试压缩", () => runStage(batch, "retry-compression")));
+    extras.append(button("重试压缩", () => runStage(batch, "retry-compression")));
   }
   const rows = element("div");
   rows.id = "batch-works";
@@ -364,6 +626,9 @@ function drawBatch() {
     });
     tick.disabled = !eligible(row, "import");
     const title = element("div");
+    if (batch.sourceType === "favorites" && row.author) {
+      title.append(element("small", row.author.name));
+    }
     title.append(element("strong", row.title),
       element("small", ["下载 " + states[row.download], "压缩 " + states[row.compressionState],
         "转写 " + states[row.transcribe], "入库 " + states[row.import],
@@ -385,23 +650,45 @@ function drawBatch() {
     line.append(tick, title, preview);
     rows.append(line);
   }
-  parent.replaceChildren(element("p", batch.destination, "muted"), meters, actions, rows);
+  const top = element("div", "", "task-top");
+  const copy = element("div");
+  copy.append(element("h2", batch.name), element("p", batch.works.length + " 条视频 · " + batch.created.replace("T", " ")));
+  if (batch.classificationMode) copy.append(element('p', batch.classificationMode === 'manual'
+    ? '主题归属：入库后到知识库确认推荐或调整'
+    : '主题归属：自动整理，不明确的小主题会提示确认'));
+  const errors = batch.works.filter(row => [row.download,row.transcribe,row.import].includes("failed")).length;
+  const completed = batch.works.every(row => ["done","existing"].includes(row.import));
+  const stageName = {download:"正在下载",transcribe:"正在转写",import:"正在入库"}[batch.stage];
+  const stateName = stageName || (errors ? errors + " 条待重试" : completed ? "已入库" : toDownload.length ? "待下载" : toTranscribe.length ? "待转写" : toImport.length ? "待入库" : "处理中");
+  top.append(copy, element("span", stateName, "status-pill" + (completed ? " done" : "")));
+  if (completed) {
+    const view = button("查看知识库", () => task(() => api("library")));
+    view.className = "primary";
+    actions.append(view);
+  }
+  const bottom = element("div", "", "task-bottom");
+  bottom.append(element("small", batch.destination), actions);
+  const details = element("details", "", "task-detail");
+  details.id = "batch-details";
+  details.open = expanded;
+  details.append(element("summary", "查看视频明细与口播稿（" + batch.works.length + " 条）"), rows);
+  parent.replaceChildren(top, meters, bottom);
+  if (active && !batch.stage && (toDownload.length || toTranscribe.length || toImport.length)) {
+    parent.append(element("p", "另一批视频正在处理，完成后可继续本批。", "small-note"));
+  }
+  if (extras.children.length) parent.append(operations);
+  parent.append(details);
   if (batch.error) parent.append(element("p", batch.error, "error-text"));
   rows.scrollTop = oldScroll;
 }
 
 async function refresh(first = false) {
   status = await api("status");
-  if (first) {
-    get("downloader").value = status.settings.downloader;
-    get("catalog-tool").value = status.settings.catalogTool;
-    get("auto-transcribe").value = String(status.settings.autoTranscribe);
-    if (status.settings.transcribeDevice) {
-      get("transcribe-device").value = status.settings.transcribeDevice;
-      get("transcribe-device-setting").hidden = false;
-    }
-    get("auto-import").value = String(status.settings.autoImport);
-  }
+  drawAccount();
+  updateSelection();
+  get("task-badge").textContent = status.batches.length;
+  drawRecent();
+  if (first) fillSettings();
   for (const [field, capability] of [["downloader", "download"], ["catalog-tool", "catalog"]]) {
     const option = get(field).querySelector('[value="f2"]');
     option.disabled = !status.f2[capability];
@@ -421,6 +708,24 @@ async function refresh(first = false) {
   list.hidden = !current;
   list.value = current;
   drawBatch();
+}
+
+function fillSettings() {
+  if (!status) return;
+  if (status.account) {
+    get("download-config").hidden = false;
+    get("default-folder").value = status.defaultFolder || "";
+    get("download-timeout").value = status.account.downloadTimeout;
+    get("download-retries").value = status.account.downloadRetries;
+  }
+  get("downloader").value = status.settings.downloader;
+  get("catalog-tool").value = status.settings.catalogTool;
+  get("auto-transcribe").value = String(status.settings.autoTranscribe);
+  get("auto-import").value = String(status.settings.autoImport);
+  if (status.settings.transcribeDevice) {
+    get("transcribe-device").value = status.settings.transcribeDevice;
+    get("transcribe-device-setting").hidden = false;
+  }
 }
 
 refresh(true).then(() => {

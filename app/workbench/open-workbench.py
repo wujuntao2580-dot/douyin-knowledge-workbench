@@ -27,6 +27,7 @@ OPENER = build_opener(ProxyHandler({}))
 WORKFLOW_DIR = PROJECT / "app/workflow"
 sys.path.insert(0, str(WORKFLOW_DIR))
 from workflow import Workflow, message
+from library_state import LibraryState
 
 
 def playback_file(video_id, seconds):
@@ -91,7 +92,7 @@ class PlaybackHandler(BaseHTTPRequestHandler):
                 raise ValueError("请求格式无效")
             if route == "status":
                 value = self.server.workflow.status()
-                value["defaultFolder"] = str(PROJECT / "data/inputs")
+                value["defaultFolder"] = value["settings"].get("defaultFolder", str(PROJECT / "data/inputs"))
             elif route == "library":
                 open_page(self.server.server_port, self.server.key)
                 value = {}
@@ -132,8 +133,32 @@ class PlaybackHandler(BaseHTTPRequestHandler):
             return self.reply(403, "播放入口未授权")
         if url.path == "/ready":
             return self.reply(200, INSTANCE)
+        if url.path == '/knowledge':
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 1_000_000:
+                    raise ValueError('整理请求大小无效')
+                payload = json.loads(self.rfile.read(length))
+                if not isinstance(payload, dict):
+                    raise ValueError('整理请求格式无效')
+                if payload.get('action') == 'video.delete':
+                    with self.server.workflow.lock:
+                        if self.server.workflow.active or self.server.workflow.compressing:
+                            raise ValueError('视频正在处理，请在处理结束后删除')
+                        result = LibraryState().act(payload)
+                        self.server.workflow.retire_deleted(payload.get('ids', []))
+                    subprocess.run([sys.executable, '-B', '-X', 'utf8', PROJECT / 'app/catalog/build_full.py'],
+                                   check=True, timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                else:
+                    result = LibraryState().act(payload)
+                return self.reply(200, json.dumps(result, ensure_ascii=False))
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                return self.reply(400, message(error))
         if url.path != "/play":
             return self.reply(404)
+        if not VLC.is_file():
+            return self.reply(400, "尚未安装 VLC，请重跑 Install.ps1 -Player")
         fields = parse_qs(url.query)
         try:
             seconds = int(fields.get("seconds", [""])[0])

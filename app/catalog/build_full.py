@@ -6,6 +6,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 from creator_imports import load_works, read_registry
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'knowledge'))
+from library_state import LibraryState
 
 
 WORK = Path(__file__).resolve().parent
@@ -18,6 +21,7 @@ def script_json(data):
 
 videos = []
 topics = {}
+(PROJECT / 'data/inputs').mkdir(parents=True, exist_ok=True)
 
 for creator_id, creator in read_registry().items():
     local_videos = {}
@@ -83,11 +87,13 @@ compressed = PROJECT / "data/compressed"
 for video in videos:
     video["hasCompressedVideo"] = (compressed / f"{video['id']}.mp4").is_file()
 
+videos = LibraryState().effective_catalog({'videos': videos})['videos']
 template = (WORK / "template.html").read_text(encoding="utf-8")
+personal = LibraryState().sync({"videos": videos, "topics": topics})
 start = template.index('<script id="sources"')
 end = template.index('const get = id', start)
 template = (template[:start] + '<script id="catalog" type="application/json">'
-            + script_json({"topics": topics, "videos": videos})
+            + script_json({"topics": topics, "videos": videos, "personal": personal})
             + '</script>\n<script>\nconst {topics, videos} = JSON.parse(document.getElementById("catalog").textContent);\n'
             + template[end:])
 template = template.replace("已收录 0 条视频",
@@ -138,13 +144,6 @@ for (const [id, step] of [["previous", -1], ["next", 1]]) {
     get("active-topic").scrollIntoView({block:"start"});
   };
 }''')
-template = template.replace('  if (!shown.length) add(cards, "p", "videos.length ? "当前筛选没有视频。" : "知识库为空。点击右上角「下载与入库」导入你的第一个视频。", "muted");',
-                            '''  if (!shown.length) {
-    const message = creator && activeTopic
-      ? "当前主播在这个小主题下没有符合筛选条件的视频。点击左侧「全部视频」可查看当前主播的其他作品。"
-      : "videos.length ? "当前筛选没有视频。" : "知识库为空。点击右上角「下载与入库」导入你的第一个视频。";
-    add(cards, "p", message, "muted");
-  }''')
 template = template.replace('add(note, "strong", label + "　");\n    note.append(text);',
                             'note.textContent = label;')
 template = template.replace('get("detail-text").textContent = video.detail;',
@@ -228,6 +227,10 @@ template = template.replace('  dialog.showModal();', '''  if (vlcConnection && v
 template = template.replace('add(row, "p", video.core, "core");',
                             'add(row, "p", video.core || (video.transcript ? "摘要待整理 · 有口播稿" : "待转写"), video.core ? "core" : "meta");')
 
+extension = PROJECT / 'app/knowledge'
+template = template.replace('</style>', (extension / 'library.css').read_text('utf-8') + '\n</style>', 1)
+template = template.replace('<script id="catalog"', (extension / 'library.html').read_text('utf-8') + '\n<script id="catalog"', 1)
+template = template.replace('const requestedVideo =', (extension / 'library.js').read_text('utf-8') + '\nconst requestedVideo =', 1)
 LIBRARY.mkdir(parents=True, exist_ok=True)
 target = LIBRARY / "打开知识库.html"
 temporary = target.with_suffix(f".{os.getpid()}.html.tmp")

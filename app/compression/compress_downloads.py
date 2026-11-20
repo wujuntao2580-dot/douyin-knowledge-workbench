@@ -9,12 +9,13 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import av
+from imageio_ffmpeg import get_ffmpeg_exe
 
 
 PROJECT = Path(__file__).resolve().parents[2]
 MEDIA = PROJECT / "data/compressed"
 BUILDER = PROJECT / "app/catalog/build_full.py"
-FFMPEG = shutil.which("ffmpeg") or PROJECT / ".runtime/ffmpeg/ffmpeg.exe"
+FFMPEG = shutil.which("ffmpeg") or (PROJECT / ".runtime/ffmpeg/ffmpeg.exe" if (PROJECT / ".runtime/ffmpeg/ffmpeg.exe").is_file() else get_ffmpeg_exe())
 SCALE = r"scale=if(gte(iw\,ih)\,-2\,trunc(min(iw\,720)/2)*2):if(gte(iw\,ih)\,trunc(min(ih\,720)/2)*2\,-2)"
 ENCODERS = {
     "cpu": ("libx265", "-preset", "medium", "-crf", "26"),
