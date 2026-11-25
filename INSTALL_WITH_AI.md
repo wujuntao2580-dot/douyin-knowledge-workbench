@@ -4,9 +4,9 @@
 
 https://github.com/wujuntao2580-dot/douyin-knowledge-workbench
 
-请直接执行安装，不要只给步骤。先确认你能读写本机和运行程序。仓库若为私有，我需要拥有访问权限并在本机登录 GitHub；遇到 404／认证失败请明确说明，不要换成其他同名项目，也不要让我把密码或令牌贴到聊天里。
+请直接执行安装，不要只给步骤。先确认你能读写本机和运行程序。本仓库公开提供源码；遇到 404／下载失败请检查地址和网络，不要换成其他同名项目，也不要让我把密码或令牌贴到聊天里。
 
-1. 查询 GitHub 最新稳定 Release 和 main，取得远端代码并核对 VERSION、标签及提交号。当前发布版本为 1.1.0；安装时重新查询最新版，不使用旧缓存或仅凭 ZIP 文件名判断。先阅读根目录 AGENTS.md、README.md、CHANGELOG.md、VALIDATION.md。
+1. 查询 GitHub 最新稳定 Release 和 main，取得远端代码并核对 VERSION、标签及提交号。当前发布版本为 1.1.1；安装时重新查询最新版，不使用旧缓存或仅凭 ZIP 文件名判断。先阅读根目录 AGENTS.md、README.md、CHANGELOG.md、VALIDATION.md、PRIVACY.md。
 2. 选用我有写权限的固定安装目录并告知位置。若已有安装，先备份并保护 data/、.runtime/ 和本地改动；确认后台没有活动任务再更新，不能为更新而清空资料。
 3. 检查 Windows x64、Microsoft Edge、Python 3.12 x64，缺少的基础软件先配置。没有 py.exe 时用已核实的 Python 3.12 路径作为 -PythonPath。
 4. 在仓库目录执行：

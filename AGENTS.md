@@ -1,6 +1,6 @@
 # 在接收方 Windows 电脑部署与验收
 
-1. 目标仓库是 https://github.com/wujuntao2580-dot/douyin-knowledge-workbench 。先确认用户拥有访问权限，下载当前 main 或最新稳定 Release；核对 VERSION。不要用同名项目或旧缓存代替。访问受限时明确需要仓库授权，不询问或展示用户的密码和令牌。
+1. 目标公开仓库是 https://github.com/wujuntao2580-dot/douyin-knowledge-workbench 。下载当前 main 或最新稳定 Release；核对 VERSION。不要用同名项目或旧缓存代替。下载失败时核对地址和网络，不询问或展示用户的密码和令牌。遵守 PRIVACY.md，不提交接收方的私人文件。
 2. 以接收方有写权限、用户认可的目录为安装目录。已有安装先保护 data/、.runtime/ 和本地改动，不能为更新而清空数据。
 3. 检查 Windows x64、Edge、Python 3.12 x64。缺少 Python 时可用系统的软件安装工具为当前用户安装 Python.Python.3.12。没有 py.exe 时把已核实的 Python 3.12 路径传给 Install.ps1 -PythonPath。
 4. 默认运行 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install.ps1 -Models -Downloader -Player -DesktopShortcut 。仅本地模式可按用户目标省略下载器。不要把安装过程中仍在下载的状态说成完成。遇到网络问题修复当前网络后重跑；不要跳过校验或删除 data/。
